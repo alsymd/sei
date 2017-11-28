@@ -1,1 +1,1 @@
-((fun x (+ x ((fun y (* x y)) 4))) 9)
+((fun x (+ x ([fun y (* x y)] 4))) 9)

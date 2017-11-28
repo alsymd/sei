@@ -6,6 +6,7 @@ module Lib
     , interp
     ) where
 import Data.Maybe
+import Data.List.NonEmpty
 import qualified Data.HashMap as M
 import Control.Applicative
 import Control.Monad.Identity
@@ -18,6 +19,8 @@ import Data.ByteString.Char8
 type Env = M.Map ByteString Value
 type MyParsec = Parsec ByteString ()
 
+data LetExpr = LetExpr ByteString ExprS deriving(Show)
+
 data ExprS = NumS Integer
            | IdS ByteString
            | ExprS `Plus` ExprS
@@ -25,7 +28,8 @@ data ExprS = NumS Integer
            | ExprS `Mult` ExprS
            | Neg ExprS
            | FdefS ByteString ExprS
-           | AppS ExprS ExprS deriving(Show)
+           | AppS ExprS ExprS
+           | LetS [LetExpr] ExprS deriving(Show)
 
 
 data ExprC = NumC Integer
@@ -52,6 +56,11 @@ desugar s = case s of
   Neg i -> NumC (-1) :*: desugar i
   FdefS arg body -> FdefC arg (desugar body)
   AppS fun arg -> AppC (desugar fun) (desugar arg)
+  LetS letXs bodyExpr ->
+    let f (LetExpr id body) exp = AppC (FdefC id exp ) (desugar body)
+        expC = desugar bodyExpr
+    in Prelude.foldr f expC letXs
+  
   
 
 guiltDef :: P.GenLanguageDef ByteString () Identity
@@ -64,12 +73,13 @@ guiltDef = P.LanguageDef
   ,P.identLetter = alphaNum <|> oneOf extChars
   ,P.opStart = undefined
   ,P.opLetter = undefined
-  ,P.reservedNames = ["fun","+","-","*"]
+  ,P.reservedNames = ["fun","+","-","*","let"]
   ,P.reservedOpNames = []
   ,P.caseSensitive = True}
 
 lexer = P.makeTokenParser guiltDef
 
+letp = P.reserved lexer "let"
 parens = P.parens lexer
 identifier = P.identifier lexer
 fun = P.reserved lexer "fun"
@@ -78,9 +88,10 @@ plus = P.reserved lexer "+"
 mult = P.reserved lexer "*"
 minus = P.reserved lexer "-"
 lexeme = P.lexeme lexer
+brackets = P.brackets lexer
 whiteSpace = P.whiteSpace lexer
 sexp :: MyParsec ExprS
-sexp = parens (plusExpr <|> fdefExpr<|> minusExpr <|> multExpr <|> appExpr) <|>fmap NumS integer <|> fmap (IdS . pack) identifier
+sexp = ((<|>) <$> parens <*> brackets) (plusExpr <|> fdefExpr<|> minusExpr <|> multExpr <|> appExpr <|> letExprs) <|>fmap NumS integer <|> fmap (IdS . pack) identifier
   where multExpr = mult *> pure Mult <*> sexp <*> sexp
         plusExpr = plus *> pure Plus <*> sexp <*> sexp
         fdefExpr = fun *> pure FdefS  <*> fmap pack identifier <*> sexp
@@ -89,6 +100,8 @@ sexp = parens (plusExpr <|> fdefExpr<|> minusExpr <|> multExpr <|> appExpr) <|>f
           lhs <- sexp
           (Minus lhs <$>  sexp) <|> pure (Neg lhs)
         appExpr = AppS <$> sexp <*> sexp
+        letExpr = ((<|>) <$> parens <*> brackets) (LetExpr <$> fmap pack identifier <*> sexp)
+        letExprs = LetS <$> (letp *> ((<|>) <$> parens <*> brackets) (many1 letExpr)) <*> sexp
         
 
 interp :: ExprC -> Value
