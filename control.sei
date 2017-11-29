@@ -1,0 +1,2 @@
+(let [(eq (fun lhs (fun rhs (blt lhs rhs 0 (blt rhs lhs 0 1)))))]
+ ((eq 1) 0))

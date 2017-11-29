@@ -1,6 +1,0 @@
-(let ([x (box 4)]
-      [y (box 9)]
-      [z x])
-  (begin (set-box! x 100)
-	 (set-box! y 47)
-	 (+ (unbox x) (unbox z))))
