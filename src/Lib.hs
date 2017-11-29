@@ -4,7 +4,11 @@ module Lib
     , sexp
     , desugar
     , interp
+    , sexps
     ) where
+import Control.Monad.ST
+import Data.List
+import Data.STRef
 import Data.Maybe
 import Data.List.NonEmpty
 import qualified Data.HashMap as M
@@ -16,7 +20,7 @@ import qualified Text.Parsec.Token as P
 import Data.ByteString.Char8
 
 
-type Env = M.Map ByteString Value
+type Env s = M.Map ByteString (Value s)
 type MyParsec = Parsec ByteString ()
 
 data LetExpr = LetExpr ByteString ExprS deriving(Show)
@@ -29,7 +33,9 @@ data ExprS = NumS Integer
            | Neg ExprS
            | FdefS ByteString ExprS
            | AppS ExprS ExprS
-           | LetS [LetExpr] ExprS deriving(Show)
+           | LetS [LetExpr] ExprS
+           | BeginS [ExprS]
+           deriving(Show)
 
 
 data ExprC = NumC Integer
@@ -37,11 +43,22 @@ data ExprC = NumC Integer
            | ExprC :+: ExprC
            | ExprC :*: ExprC
            | FdefC ByteString ExprC
-           | AppC ExprC ExprC deriving(Show)
+           | AppC ExprC ExprC
+           | BoxC ExprC
+           | UnboxC ExprC
+           | SetBoxC ExprC
+           deriving(Show)
 
 
-data Value = NumV Integer
-           | FdefV ByteString ExprC [Env] deriving(Show)
+data Value s = NumV Integer
+            | FdefV ByteString ExprC [Env s]
+            | BoxV (STRef s (Value s)) 
+
+instance Show (Value s) where
+  show (BoxV _) = "#BoxV"
+  show (FdefV arg expr _) = "(f " ++ unpack arg ++ " " ++ show expr ++ ")"
+  show (NumV i) = show i
+  
 
 extChars = "!$%&*+-./:<=>?@^_~"
 
@@ -60,11 +77,14 @@ desugar s = case s of
     let f (LetExpr id body) exp = AppC (FdefC id exp ) (desugar body)
         expC = desugar bodyExpr
     in Prelude.foldr f expC letXs
+  BeginS beginXs ->
+     let Just (bodyExpr,restRev) =  Data.List.uncons (Data.List.reverse beginXs)
+     in desugar $ LetS (fmap (LetExpr "") (Prelude.reverse restRev)) bodyExpr
   
   
 
-guiltDef :: P.GenLanguageDef ByteString () Identity
-guiltDef = P.LanguageDef
+seiDef :: P.GenLanguageDef ByteString () Identity
+seiDef = P.LanguageDef
   {P.commentStart = ""
   ,P.commentEnd = ""
   ,P.nestedComments = False
@@ -73,12 +93,13 @@ guiltDef = P.LanguageDef
   ,P.identLetter = alphaNum <|> oneOf extChars
   ,P.opStart = undefined
   ,P.opLetter = undefined
-  ,P.reservedNames = ["fun","+","-","*","let"]
+  ,P.reservedNames = ["fun","+","-","*","let","begin"]
   ,P.reservedOpNames = []
   ,P.caseSensitive = True}
 
-lexer = P.makeTokenParser guiltDef
+lexer = P.makeTokenParser seiDef
 
+beginp = P.reserved lexer "begin"
 letp = P.reserved lexer "let"
 parens = P.parens lexer
 identifier = P.identifier lexer
@@ -91,7 +112,7 @@ lexeme = P.lexeme lexer
 brackets = P.brackets lexer
 whiteSpace = P.whiteSpace lexer
 sexp :: MyParsec ExprS
-sexp = ((<|>) <$> parens <*> brackets) (plusExpr <|> fdefExpr<|> minusExpr <|> multExpr <|> appExpr <|> letExprs) <|>fmap NumS integer <|> fmap (IdS . pack) identifier
+sexp = ((<|>) <$> parens <*> brackets) (plusExpr <|> fdefExpr<|> minusExpr <|> multExpr <|> appExpr <|> letExprs <|> beginExprs) <|>fmap NumS integer <|> fmap (IdS . pack) identifier
   where multExpr = mult *> pure Mult <*> sexp <*> sexp
         plusExpr = plus *> pure Plus <*> sexp <*> sexp
         fdefExpr = fun *> pure FdefS  <*> fmap pack identifier <*> sexp
@@ -102,15 +123,21 @@ sexp = ((<|>) <$> parens <*> brackets) (plusExpr <|> fdefExpr<|> minusExpr <|> m
         appExpr = AppS <$> sexp <*> sexp
         letExpr = ((<|>) <$> parens <*> brackets) (LetExpr <$> fmap pack identifier <*> sexp)
         letExprs = LetS <$> (letp *> ((<|>) <$> parens <*> brackets) (many1 letExpr)) <*> sexp
+        beginExprs = beginp *> pure BeginS <*> many1 sexp
         
 
-interp :: ExprC -> Value
+interp :: ExprC -> Value s
 interp  = flip interpEnv []
 
 
 lookupValue id = Prelude.head . catMaybes . fmap (M.lookup id)
 
-interpEnv :: ExprC -> [Env] -> Value
+
+-- interpEnvST :: runST $ do
+  
+sexps = Control.Applicative.many sexp
+
+interpEnv :: ExprC -> [Env s] -> Value s
 interpEnv exp env = case exp of
   NumC i -> NumV i
   i :+: j -> let NumV lhs = interpEnv i env
