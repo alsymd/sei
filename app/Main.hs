@@ -1,7 +1,7 @@
 module Main where
 
 import qualified Data.ByteString as BS
-import Lib
+import Sei
 
 
 printValue (Left err) = print err
