@@ -28,22 +28,37 @@ sei
 It reads a single form from standard input and prints the result.
 
 ## Examples
-```
+```scheme
 ; Recursion
-(letrec ([fact (fun x (blt x 1 1 (* x (fact (- x 1)))))])
+(letrec ([fact (fun (x) (blt x 1 1 (* x (fact (- x 1)))))])
   (fact 10))
 ```
 
-```
+```scheme
 ; Set
-(let ([f (fun x (set! x 3))])
+(let ([f (fun (x) (set! x 3))])
   (let ([y 5])
     (begin
       (f y)
       y)))
 ```
 
+```scheme
+; Control & misc
+(let [(eq (fun (lhs rhs) (blt lhs rhs false (blt rhs lhs false true))))
+      (cons (fun (x xs) (fun (f) (f x xs))))
+      (fst (fun (p q) p))
+      (snd (fun (p q) q))
+      (car (fun (lst) (lst fst)))
+      (cdr (fun (lst) (lst snd)))]
+ (let [(p (cons 1 2))
+       (first-element (car p))
+       (second-element (cdr p))]
+       (if (eq first-element (- first-element 1)) 233 4399)))
+```
+
 ## Features
 * Recursion
 * First-class function
 * Mutable variable
+* Currying by default (Core language only supports functions with single element)

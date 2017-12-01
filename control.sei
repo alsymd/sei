@@ -1,2 +1,10 @@
-(let [(eq (fun lhs (fun rhs (blt lhs rhs 0 (blt rhs lhs 0 1)))))]
- ((eq 1) 0))
+(let [(eq (fun (lhs rhs) (blt lhs rhs false (blt rhs lhs false true))))
+      (cons (fun (x xs) (fun (f) (f x xs))))
+      (fst (fun (p q) p))
+      (snd (fun (p q) q))
+      (car (fun (lst) (lst fst)))
+      (cdr (fun (lst) (lst snd)))]
+ (let [(p (cons 1 2))
+       (first-element (car p))
+       (second-element (cdr p))]
+       (if (eq first-element (- first-element 1)) 233 4399)))

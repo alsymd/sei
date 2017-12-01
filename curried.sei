@@ -1,2 +1,2 @@
-(let [(plus (fun x (fun y (+ x y))))]
+(let [(plus (fun (x) (fun (y) (+ x y))))]
  ((plus 100) 10))

@@ -48,10 +48,10 @@ data ExprS
   | ExprS `Minus` ExprS
   | ExprS `Mult` ExprS
   | Neg ExprS
-  | FdefS ByteString
+  | FdefS [ByteString]
           ExprS
   | AppS ExprS
-         ExprS
+         [ExprS]
   | LetS [LetExpr]
          ExprS
   | BeginS [ExprS]
@@ -63,6 +63,8 @@ data ExprS
           ExprS
   | LetRecS [LetExpr]
           ExprS
+  | BoolS Bool
+  | IfS ExprS ExprS ExprS
   deriving (Show)
 
 data ExprC
@@ -83,6 +85,8 @@ data ExprC
           ExprC
           ExprC
   | RecAppC ExprC ExprC
+  | BoolC Bool
+  | IfC ExprC ExprC ExprC
   deriving (Show)
 
 data Value
@@ -90,6 +94,8 @@ data Value
   | FdefV ByteString
           ExprC
           Env
+  | BoolV Bool
+  | VoidV
   deriving (Show)
 
 extChars = "!$%&*+-./:<=>?@^_~"
@@ -103,14 +109,15 @@ desugar s =
     lhs `Mult` rhs -> desugar lhs :*: desugar rhs
     lhs `Minus` rhs -> desugar lhs :+: (NumC (-1) :*: desugar rhs)
     Neg i -> NumC (-1) :*: desugar i
-    FdefS arg body -> FdefC arg (desugar body)
-    AppS fun arg -> AppC (desugar fun) (desugar arg)
+    FdefS arg body -> Prelude.foldr  FdefC (desugar body) arg
+    AppS fun args -> Prelude.foldl AppC (desugar fun) (fmap desugar args)
     LetS letXs bodyExpr ->
       let f (LetExpr id body) exp = AppC (FdefC id exp) (desugar body)
           expC = desugar bodyExpr
       in Prelude.foldr f expC letXs
     BeginS beginXs -> Prelude.foldr1 SeqC $ fmap desugar beginXs
     SetS expr1 expr2 -> SetC expr1 (desugar expr2)
+    IfS cond expr1 expr2 -> IfC (desugar cond) (desugar expr1) (desugar expr2)
     LessS expr1 expr2 thenExpr elseExpr ->
       LessC
         (desugar expr1)
@@ -121,9 +128,8 @@ desugar s =
       let f (LetExpr id body) exp = RecAppC (FdefC id exp) (desugar body)
           expC = desugar bodyExpr
       in Prelude.foldr f expC letXs
-    -- LetrecS xs body -> desugar $ Prelude.foldr f  body xs
-    --   where f (LetExpr name body) expr =
-    --           LetS 
+    BoolS b -> BoolC b
+
 
 seiDef :: P.GenLanguageDef ByteString () Identity
 seiDef =
@@ -136,12 +142,19 @@ seiDef =
   , P.identLetter = alphaNum <|> oneOf extChars
   , P.opStart = undefined
   , P.opLetter = undefined
-  , P.reservedNames = ["fun", "+", "-", "*", "let", "begin", "set!","blt","letrec"]
+  , P.reservedNames = ["fun", "+", "-", "*", "let", "begin", "set!","blt","letrec","true","false","nil","if"]
   , P.reservedOpNames = []
   , P.caseSensitive = True
   }
+  
 
 lexer = P.makeTokenParser seiDef
+
+truep = P.reserved lexer "true"
+
+ifp = P.reserved lexer "if"
+
+falsep = P.reserved lexer "false"
 
 letrecp = P.reserved lexer "letrec"
 
@@ -180,18 +193,21 @@ sexp =
      beginExprs <|>
      setExpr <|>
      bltExpr <|>
-     letRecExprs) <|>
+     letRecExprs <|>
+     ifExpr) <|>
   fmap NumS integer <|>
-  fmap (VarS . pack) identifier
+  try (fmap (VarS . pack) identifier) <|>
+  boolExpr
   where
     multExpr = mult *> pure Mult <*> sexp <*> sexp <?> "multiplication"
     plusExpr = plus *> pure Plus <*> sexp <*> sexp <?> "plus"
-    fdefExpr = fun *> pure FdefS <*> fmap pack identifier <*> sexp <?> "function definition"
+    fdefExpr = fun *> pure FdefS <*> parens (many1 (fmap pack identifier)) <*> sexp <?> "function definition"
+    ifExpr = ifp *> pure IfS <*> sexp <*> sexp <*> sexp
     minusExpr = do
       minus
       lhs <- sexp
       (Minus lhs <$> sexp <?> "Minus") <|> (pure (Neg lhs )<?> "Negation")
-    appExpr = AppS <$> sexp <*> sexp <?> "function application"
+    appExpr = AppS <$> sexp <*> many1 sexp <?> "function application"
     letExpr =
       ((<|>) <$> parens <*> brackets)
         (LetExpr <$> fmap pack identifier <*> sexp) <?> "let pair"
@@ -204,6 +220,8 @@ sexp =
     letRecExprs =
       LetRecS <$> (letrecp *> ((<|>) <$> parens <*> brackets) (many1 letExpr)) <*>
       sexp <?> "letrec expression"
+    boolExpr = (truep *> pure (BoolS True) <|> falsep *> pure (BoolS False))
+
     
 
 -- interp :: ExprC -> Value
@@ -247,12 +265,18 @@ interpEnvSto exp env sto ids =
       in case v1 < v2 of
            True -> interpEnvSto thenExpr env sto'' ids''
            False -> interpEnvSto elseExpr env sto'' ids''
+    IfC cond thenExp elseExp ->
+      let ((BoolV c), sto', ids') = interpEnvSto cond env sto ids
+      in case c of
+        True -> interpEnvSto thenExp env sto' ids'
+        False -> interpEnvSto elseExp env sto' ids'
     RecAppC f arg ->
       let (FdefV argId body fenv, sto', ids') = interpEnvSto f env sto ids
           (x:xs) = ids'
           extendedEnv = M.insert argId x env
           (argV, sto'', ids'') = interpEnvSto arg extendedEnv  (IM.insert x argV sto') xs 
       in interpEnvSto body extendedEnv sto'' ids''
+    BoolC b -> (BoolV b, sto, ids)
 
 runParserLexeme :: MyParsec a -> ByteString -> Either ParseError a
 runParserLexeme p = runParser (whiteSpace *> p) () ""
