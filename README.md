@@ -28,13 +28,13 @@ sei
 It reads a single form from standard input and prints the result.
 
 ## Examples
-```scheme
+```racket
 ; Recursion
 (letrec ([fact (fun (x) (blt x 1 1 (* x (fact (- x 1)))))])
   (fact 10))
 ```
 
-```scheme
+```racket
 ; Set
 (let ([f (fun (x) (set! x 3))])
   (let ([y 5])
@@ -43,7 +43,7 @@ It reads a single form from standard input and prints the result.
       y)))
 ```
 
-```scheme
+```racket
 ; Control & misc
 (let [(eq (fun (lhs rhs) (blt lhs rhs false (blt rhs lhs false true))))
       (cons (fun (x xs) (fun (f) (f x xs))))
