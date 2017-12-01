@@ -10,7 +10,6 @@ module Sei
   , interp'
   ) where
 import Control.Applicative
-import Debug.Trace
 import Control.Category
 import Control.Monad
 import Control.Monad.Identity
@@ -48,9 +47,6 @@ data Value
   | VoidV
   deriving (Show)
 
-isNumV :: Value -> Bool
-isNumV (NumV _) = True
-isNumV _ = False
 
 extractNumV :: Value -> InterpMonad Integer
 extractNumV (NumV i) = pure i
@@ -63,10 +59,6 @@ extractBoolV v = throwError $ "Expecting NumV but encountered " ++ show v
 extractFdefV :: Value -> InterpMonad Value
 extractFdefV f@(FdefV _ _ _) = pure f
 extractFdefV v = throwError $ "Expecting FdefV but encountered " ++ show v
-
-isBoolV :: Value -> Bool
-isBoolV (BoolV _) = True
-isBoolV _ = False
 
 
 data ExprS
@@ -132,17 +124,6 @@ newLoc = do (x:xs) <- fmap (^.ids) get
             modify (ids .~ xs)
             pure x
 
-recycleLoc :: Int -> InterpMonad ()
-recycleLoc x = modify ((over ids  (x:)) :: InterpState -> InterpState)
-
-lookupLoc :: ByteString -> M.Map ByteString a -> Maybe a
-lookupLoc = M.lookup
-
-fetchValue :: IM.Key -> IM.IntMap a -> Maybe a
-fetchValue = IM.lookup
-
-getValue :: ByteString -> M.Map ByteString IM.Key -> IM.IntMap b -> Maybe b
-getValue k env sto = lookupLoc k env >>= flip fetchValue sto
 
 
 storeV :: Value -> InterpMonad Int
@@ -374,6 +355,7 @@ interpM exp =
     VoidC -> pure VoidV
     
     -- Makes the arg of expr visible to argExpr
+    -- Note the mdo.
     RecAppC expr argExpr -> mdo
       FdefV argId body fenv <- extractFdefV =<< interpM expr
       argLoc <- newLoc
@@ -381,7 +363,11 @@ interpM exp =
       bodyIds <- gets (view ids)
       extendedEnv <- gets (M.insert argId argLoc .(view env))
       let argState = InterpState{_env = extendedEnv, _sto = IM.insert argLoc argV bodySto, _ids = bodyIds}
-          Right (argV,InterpState{_sto=sto',_ids=ids'}) = flip runInterp argState $ (interpM argExpr)
+          result = flip runInterp argState $ (interpM argExpr)
+      case result of
+        Left err -> throwError err
+        Right _ -> pure ()
+      let Right (argV,InterpState{_sto=sto',_ids=ids'}) = result
       modify (set ids ids')
       modify (set sto sto')
       let bodyEnv = M.insert argId argLoc fenv
