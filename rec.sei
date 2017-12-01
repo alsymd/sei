@@ -1,2 +1,5 @@
-(letrec ([fact (fun x (blt x 1 1 (* x (fact (- x 1)))))])
+(letrec ([fact (fun (x) (blt x 1 1 (* x (fact (- x 1)))))])
   (fact 4))
+
+;(letrec ([fact 4])
+; fact)

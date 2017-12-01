@@ -1,45 +1,73 @@
+{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE OverloadedStrings #-}
-
+{-# OPTIONS -Wall #-}
+{-# LANGUAGE RecursiveDo #-}
 module Sei
   ( runParserLexeme
   , sexp
   , desugar
-  , interp
   , sexps
+  , interp'
   ) where
-
 import Control.Applicative
+import Debug.Trace
 import Control.Category
 import Control.Monad
 import Control.Monad.Identity
-import Control.Monad.ST
+import Control.Monad.State
+import Control.Monad.Except
 import Data.ByteString.Char8
 import qualified Data.HashMap as M
 import qualified Data.IntMap as IM
 import Data.List
-import Data.List.NonEmpty
 import Data.Maybe
-import Data.STRef
 import Prelude hiding ((.), id)
 import Text.Parsec hiding ((<|>))
 import qualified Text.Parsec.Token as P
+import Control.Lens
+
+type InterpMonad = (StateT InterpState (ExceptT String Identity))
+
+runInterp :: StateT a1 (ExceptT e Identity) a -> a1 -> Either e (a, a1)
+runInterp s = runIdentity . runExceptT . runStateT s
 
 type Env = M.Map ByteString Int
-
-type Storage = IM.IntMap Value
-
-lookupLoc = M.lookup
-
-fetchValue = IM.lookup
-
-getValue k env sto = lookupLoc k env >>= flip fetchValue sto
-
-type MyParsec = Parsec ByteString ()
 
 data LetExpr =
   LetExpr ByteString
           ExprS
   deriving (Show)
+
+
+data Value
+  = NumV Integer
+  | FdefV ByteString
+          ExprC
+          Env
+  | BoolV Bool
+  | VoidV
+  deriving (Show)
+
+isNumV :: Value -> Bool
+isNumV (NumV _) = True
+isNumV _ = False
+
+extractNumV :: Value -> InterpMonad Integer
+extractNumV (NumV i) = pure i
+extractNumV v = throwError $ "Expecting NumV but encountered " ++  show v
+
+extractBoolV :: Value -> InterpMonad Bool
+extractBoolV (BoolV b) = pure b
+extractBoolV v = throwError $ "Expecting NumV but encountered " ++ show v
+
+extractFdefV :: Value -> InterpMonad Value
+extractFdefV f@(FdefV _ _ _) = pure f
+extractFdefV v = throwError $ "Expecting FdefV but encountered " ++ show v
+
+isBoolV :: Value -> Bool
+isBoolV (BoolV _) = True
+isBoolV _ = False
+
 
 data ExprS
   = NumS Integer
@@ -65,6 +93,8 @@ data ExprS
           ExprS
   | BoolS Bool
   | IfS ExprS ExprS ExprS
+  | DefS ByteString ExprS
+  | VoidS
   deriving (Show)
 
 data ExprC
@@ -87,22 +117,70 @@ data ExprC
   | RecAppC ExprC ExprC
   | BoolC Bool
   | IfC ExprC ExprC ExprC
+  | VoidC
   deriving (Show)
 
-data Value
-  = NumV Integer
-  | FdefV ByteString
-          ExprC
-          Env
-  | BoolV Bool
-  | VoidV
-  deriving (Show)
+type Storage = IM.IntMap Value
 
+data InterpState = InterpState {_env :: Env, _sto :: Storage, _ids :: [Int]} deriving (Show)
+emptyState :: InterpState
+emptyState = InterpState{_env=M.empty, _sto=IM.empty, _ids=[0..]}
+makeLenses ''InterpState
+
+newLoc :: InterpMonad Int
+newLoc = do (x:xs) <- fmap (^.ids) get
+            modify (ids .~ xs)
+            pure x
+
+recycleLoc :: Int -> InterpMonad ()
+recycleLoc x = modify ((over ids  (x:)) :: InterpState -> InterpState)
+
+lookupLoc :: ByteString -> M.Map ByteString a -> Maybe a
+lookupLoc = M.lookup
+
+fetchValue :: IM.Key -> IM.IntMap a -> Maybe a
+fetchValue = IM.lookup
+
+getValue :: ByteString -> M.Map ByteString IM.Key -> IM.IntMap b -> Maybe b
+getValue k env sto = lookupLoc k env >>= flip fetchValue sto
+
+
+storeV :: Value -> InterpMonad Int
+storeV v = do
+  loc <- newLoc
+  modify (over sto (IM.insert loc v))
+  pure loc
+
+fetchV :: ByteString -> InterpMonad Value
+fetchV id = do
+  loc <- fetchLoc id
+  mv <- gets (IM.lookup loc . view sto)
+  case mv of
+    Nothing -> throwError $ "Variable " ++ show id ++ " exists but storage is not available. Please report this as a bug."
+    Just v -> pure v
+
+modifyV :: Int -> Value -> InterpMonad Value
+modifyV loc v = modify (over sto (IM.insert loc v)) *> pure v
+
+fetchLoc :: ByteString -> InterpMonad Int
+fetchLoc id = do
+  mloc <- gets (M.lookup id . view env)
+  case mloc of
+    Nothing -> throwError $ "No variable named " ++ unpack id
+    Just loc -> pure loc
+
+type MyParsec = Parsec ByteString ()
+
+
+
+
+extChars :: [Char]
 extChars = "!$%&*+-./:<=>?@^_~"
 
 desugar :: ExprS -> ExprC
 desugar s =
   case s of
+    VoidS -> VoidC
     NumS i -> NumC i
     VarS s -> VarC s
     lhs `Plus` rhs -> desugar lhs :+: desugar rhs
@@ -142,48 +220,70 @@ seiDef =
   , P.identLetter = alphaNum <|> oneOf extChars
   , P.opStart = undefined
   , P.opLetter = undefined
-  , P.reservedNames = ["fun", "+", "-", "*", "let", "begin", "set!","blt","letrec","true","false","nil","if"]
+  , P.reservedNames = ["fun", "+", "-", "*", "let", "begin", "set!","blt","letrec","true","false","nil","if","def"]
   , P.reservedOpNames = []
   , P.caseSensitive = True
   }
   
 
+lexer :: P.GenTokenParser ByteString () Identity
 lexer = P.makeTokenParser seiDef
 
+defp :: ParsecT ByteString () Identity ()
+defp = P.reserved lexer "def"
+
+truep :: ParsecT ByteString () Identity ()
 truep = P.reserved lexer "true"
 
+ifp :: ParsecT ByteString () Identity ()
 ifp = P.reserved lexer "if"
 
+falsep :: ParsecT ByteString () Identity ()
 falsep = P.reserved lexer "false"
 
+letrecp :: ParsecT ByteString () Identity ()
 letrecp = P.reserved lexer "letrec"
 
+bltp :: ParsecT ByteString () Identity ()
 bltp = P.reserved lexer "blt"
 
+setp :: ParsecT ByteString () Identity ()
 setp = P.reserved lexer "set!"
 
+beginp :: ParsecT ByteString () Identity ()
 beginp = P.reserved lexer "begin"
 
+letp :: ParsecT ByteString () Identity ()
 letp = P.reserved lexer "let"
 
+parens :: ParsecT ByteString () Identity a -> ParsecT ByteString () Identity a
 parens = P.parens lexer
 
+identifier :: ParsecT ByteString () Identity String
 identifier = P.identifier lexer
 
+fun :: ParsecT ByteString () Identity ()
 fun = P.reserved lexer "fun"
 
+integer :: ParsecT ByteString () Identity Integer
 integer = P.integer lexer
 
+plus :: ParsecT ByteString () Identity ()
 plus = P.reserved lexer "+"
 
+mult :: ParsecT ByteString () Identity ()
 mult = P.reserved lexer "*"
 
+minus :: ParsecT ByteString () Identity ()
 minus = P.reserved lexer "-"
 
+lexeme :: ParsecT ByteString () Identity a -> ParsecT ByteString () Identity a
 lexeme = P.lexeme lexer
 
+brackets :: ParsecT ByteString () Identity a -> ParsecT ByteString () Identity a
 brackets = P.brackets lexer
 
+whiteSpace :: ParsecT ByteString () Identity ()
 whiteSpace = P.whiteSpace lexer
 
 sexp :: MyParsec ExprS
@@ -221,62 +321,87 @@ sexp =
       LetRecS <$> (letrecp *> ((<|>) <$> parens <*> brackets) (many1 letExpr)) <*>
       sexp <?> "letrec expression"
     boolExpr = (truep *> pure (BoolS True) <|> falsep *> pure (BoolS False))
+    -- defExpr = defp *> DefS <*> fmap pack identifier <*> sexp <?> "def expression"
 
     
 
--- interp :: ExprC -> Value
-interp expr = (\(v,_,_) -> v) $ interpEnvSto expr M.empty IM.empty [0 ..]
 
+sexps :: ParsecT ByteString () Identity [ExprS]
 sexps = Control.Applicative.many sexp
 
--- Yes, I know this function looks stupid.
--- It should be and will be changed to a state monad sometime in the future, after I'm sure which states are the ones that I actually need.
-interpEnvSto :: ExprC -> Env -> Storage -> [Int] -> (Value, Storage, [Int])
-interpEnvSto exp env sto ids =
+
+interpM :: ExprC -> InterpMonad Value
+interpM exp =
   case exp of
-    NumC i -> (NumV i, sto, ids)
-    i :+: j ->
-      let (NumV (lhs), sto', ids') = interpEnvSto i env sto ids
-          (NumV (rhs), sto'', ids'') = interpEnvSto j env sto' ids'
-      in (NumV (lhs + rhs), sto'', ids'')
-    i :*: j ->
-      let (NumV lhs, sto', ids') = interpEnvSto i env sto ids
-          (NumV rhs, sto'', ids'') = interpEnvSto j env sto' ids'
-      in (NumV (lhs * rhs), sto'', ids'')
-    AppC f arg ->
-      let (FdefV argId body fenv, sto', ids') = interpEnvSto f env sto ids
-          (argV, sto'', ids'') = interpEnvSto arg env sto' ids'
-          (x:xs) = ids''
-      in interpEnvSto body (M.insert argId x fenv) (IM.insert x argV sto'') xs
-    VarC id -> (fromJust $ getValue id env sto, sto, ids)
-    FdefC arg body ->
-      let shadowedEnv = M.delete arg $ env
-      in (FdefV arg body shadowedEnv, sto, ids)
-    SeqC exp1 exp2 ->
-      let (_, sto', ids') = interpEnvSto exp1 env sto ids
-      in interpEnvSto exp2 env sto' ids'
-    SetC var exp ->
-      let loc = fromJust $ lookupLoc var env
-          (v, sto', ids') = interpEnvSto exp env sto ids
-      in (v, IM.insert loc v sto', ids')
-    LessC expr1 expr2 thenExpr elseExpr ->
-      let ((NumV v1), sto', ids') = interpEnvSto expr1 env sto ids
-          ((NumV v2), sto'', ids'') = interpEnvSto expr2 env sto' ids'
-      in case v1 < v2 of
-           True -> interpEnvSto thenExpr env sto'' ids''
-           False -> interpEnvSto elseExpr env sto'' ids''
-    IfC cond thenExp elseExp ->
-      let ((BoolV c), sto', ids') = interpEnvSto cond env sto ids
-      in case c of
-        True -> interpEnvSto thenExp env sto' ids'
-        False -> interpEnvSto elseExp env sto' ids'
-    RecAppC f arg ->
-      let (FdefV argId body fenv, sto', ids') = interpEnvSto f env sto ids
-          (x:xs) = ids'
-          extendedEnv = M.insert argId x env
-          (argV, sto'', ids'') = interpEnvSto arg extendedEnv  (IM.insert x argV sto') xs 
-      in interpEnvSto body extendedEnv sto'' ids''
-    BoolC b -> (BoolV b, sto, ids)
+    NumC i -> pure . NumV $ i
+    i :+: j -> fmap NumV $ (+) <$> (extractNumV =<< interpM i) <*> (extractNumV =<< interpM j)
+    i :*: j -> fmap NumV $ (*) <$> (extractNumV =<< interpM i) <*> (extractNumV =<< interpM j)
+    AppC f arg -> do
+      FdefV argId body fenv <- extractFdefV =<< interpM f
+      argV <- interpM arg
+      loc <- storeV argV
+      bodySto <- gets (view sto)
+      bodyIds <- gets (view ids)
+      let bodyEnv = M.insert argId loc fenv
+          bodyState = InterpState{_env = bodyEnv, _sto = bodySto, _ids = bodyIds}
+          evalResult = flip runInterp bodyState $ (interpM body)
+      case evalResult of
+        Left err -> throwError err
+        Right (v,InterpState{_sto = sto', _ids = ids'}) -> do
+          modify (set ids ids')
+          modify (set sto sto')
+          pure v
+    VarC id ->  fetchV id
+    FdefC arg body -> do
+      fenv <- gets (M.delete arg . (view env))
+      pure $ FdefV arg body fenv
+    SeqC exp1 exp2 -> interpM exp1 *> interpM exp2
+    SetC var exp -> do
+      loc <- fetchLoc var
+      interpM exp >>= modifyV loc
+    LessC expr1 expr2 thenExpr elseExpr -> do
+      v1 <- interpM expr1 >>= extractNumV
+      v2 <- interpM expr2 >>= extractNumV
+      case v1 < v2 of
+        True -> interpM thenExpr
+        False -> interpM elseExpr
+    IfC cond thenExpr elseExpr -> do
+      b <- interpM cond >>= extractBoolV
+      case b of
+        True -> interpM thenExpr
+        False -> interpM elseExpr
+    BoolC b -> pure (BoolV b)
+    VoidC -> pure VoidV
+    
+    -- Makes the arg of expr visible to argExpr
+    RecAppC expr argExpr -> mdo
+      FdefV argId body fenv <- extractFdefV =<< interpM expr
+      argLoc <- newLoc
+      bodySto <- gets (view sto)
+      bodyIds <- gets (view ids)
+      extendedEnv <- gets (M.insert argId argLoc .(view env))
+      let argState = InterpState{_env = extendedEnv, _sto = IM.insert argLoc argV bodySto, _ids = bodyIds}
+          Right (argV,InterpState{_sto=sto',_ids=ids'}) = flip runInterp argState $ (interpM argExpr)
+      modify (set ids ids')
+      modify (set sto sto')
+      let bodyEnv = M.insert argId argLoc fenv
+      let bodyState = InterpState{_env = bodyEnv, _sto = sto', _ids = bodyIds}
+      let evalResult = flip runInterp bodyState $ (interpM body)
+      case evalResult of
+        Left err -> throwError err
+        Right (v,InterpState{_sto = sto'', _ids = ids''}) -> do
+          modify (set ids ids'')
+          modify (set sto sto'')
+          pure v
+      
+interp' :: ExprC -> Either String Value
+interp' expr =
+  let result = runInterp (interpM expr) emptyState
+  in case result of
+    Left err -> Left err
+    Right (v,_) -> Right v
+
+
 
 runParserLexeme :: MyParsec a -> ByteString -> Either ParseError a
 runParserLexeme p = runParser (whiteSpace *> p) () ""
